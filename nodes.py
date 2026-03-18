@@ -1,3 +1,4 @@
+import contextlib
 import os
 import gc
 import torch
@@ -58,7 +59,7 @@ class FireRedFastLoader:
     """
 
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "base_model_id": ("STRING", {
@@ -126,21 +127,21 @@ class FireRedFastLoader:
         from .qwenimage.transformer_qwenimage import QwenImageTransformer2DModel
 
         device = mm.get_torch_device()
-        device_str = str(device)  # e.g. "cuda:0"
 
-        # Load transformer directly to VRAM so it does NOT occupy CPU RAM while
-        # the large text encoder (Qwen2.5-VL ~14 GB) loads.  This mirrors the
-        # original Space and is the key fix for 12 GB VRAM / limited RAM setups.
-        print(f"[FireRedFast] Loading fast transformer → {device_str} ...")
+        # Load transformer to CPU RAM first.  With 62 GB RAM this is fine, and
+        # loading to CPU (not VRAM) is required so that sequential_cpu_offload
+        # can install its hooks cleanly without conflicting with device_map.
+        print(f"[FireRedFast] Loading fast transformer to CPU ...")
         transformer = QwenImageTransformer2DModel.from_pretrained(
             transformer_path,
             torch_dtype=dtype,
-            device_map=device_str,
+            low_cpu_mem_usage=True,
         )
         pbar.update(1)
+        gc.collect()
 
-        # Load the remaining pipeline components (VAE, text encoder, scheduler …)
-        # to CPU RAM via memory-mapped safetensors to keep the RAM peak low.
+        # Load remaining pipeline components (text encoder, VAE, scheduler …)
+        # to CPU via memory-mapped safetensors.
         print(f"[FireRedFast] Loading pipeline components from {base_path} ({precision}) ...")
         pipe = QwenImageEditPlusPipeline.from_pretrained(
             base_path,
@@ -149,14 +150,16 @@ class FireRedFastLoader:
             low_cpu_mem_usage=True,
         )
         pbar.update(1)
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        # VAE memory optimisations — slice/tile large images to reduce decode peak
+        # VAE optimisations — reduce decode VRAM peak for large images
         if hasattr(pipe.vae, "enable_slicing"):
             pipe.vae.enable_slicing()
         if hasattr(pipe.vae, "enable_tiling"):
             pipe.vae.enable_tiling()
 
-        # Attention slicing keeps per-step attention memory bounded
+        # Attention slicing caps the per-step activation spike inside the transformer
         if hasattr(pipe, "enable_attention_slicing"):
             pipe.enable_attention_slicing(1)
 
@@ -182,7 +185,7 @@ class FireRedFastLoader:
         _cached_pipe = pipe
         _cached_key = cache_key
 
-        print(f"[FireRedFast] Pipeline ready.")
+        print("[FireRedFast] Pipeline ready.")
         return ({"pipeline": pipe, "dtype": dtype},)
 
 
@@ -199,7 +202,7 @@ class FireRedFastSampler:
     """
 
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "firered_fast_pipe": ("FIRERED_FAST_PIPE",),
@@ -263,10 +266,11 @@ class FireRedFastSampler:
         pipe = firered_fast_pipe["pipeline"]
 
         # Collect PIL images
-        pil_images = []
-        for img_tensor in [image1, image2]:
-            if img_tensor is not None:
-                pil_images.append(comfy_images_to_pil(img_tensor)[0])
+        pil_images = [
+            comfy_images_to_pil(t)[0]
+            for t in (image1, image2)
+            if t is not None
+        ]
 
         # Resolve output dimensions
         if pil_images:
@@ -276,9 +280,9 @@ class FireRedFastSampler:
         else:
             # Text-to-image fallback — provide a blank image
             if width == 0:
-                width = 1024
+                width = 768
             if height == 0:
-                height = 1024
+                height = 768
             from PIL import Image as PILImage
             image_arg = PILImage.new("RGB", (width, height), (255, 255, 255))
 
@@ -315,7 +319,7 @@ class FireRedFastUnloader:
     """Explicitly frees the pipeline from memory."""
 
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {"required": {"firered_fast_pipe": ("FIRERED_FAST_PIPE",)}}
 
     RETURN_TYPES = ()
@@ -327,10 +331,8 @@ class FireRedFastUnloader:
     def unload(self, firered_fast_pipe):
         global _cached_pipe, _cached_key
         pipe = firered_fast_pipe.get("pipeline")
-        try:
+        with contextlib.suppress(Exception):
             pipe.remove_all_hooks()
-        except Exception:
-            pass
         del pipe
         del firered_fast_pipe
         _cached_pipe = None

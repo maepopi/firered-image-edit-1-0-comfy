@@ -25,7 +25,7 @@ def pil_to_comfy_images(images):
     return torch.stack(tensors)
 
 
-def auto_resolution(width, height, target_pixels=1024 * 1024):
+def auto_resolution(width, height, target_pixels=768 * 768):
     """Preserve aspect ratio targeting ~1024x1024 total pixels, snapped to 8px."""
     if width == 0 or height == 0:
         return 1024, 1024
