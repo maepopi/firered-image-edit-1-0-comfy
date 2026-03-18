@@ -29,11 +29,20 @@ def _resolve_or_download(repo_id, models_dir):
         return repo_id
     safe_name = repo_id.replace("/", "--")
     local_path = os.path.join(models_dir, safe_name)
+    from huggingface_hub import snapshot_download
     if not os.path.exists(local_path):
         print(f"[FireRedFast] Downloading {repo_id} → {local_path} ...")
-        from huggingface_hub import snapshot_download
         snapshot_download(repo_id=repo_id, local_dir=local_path, local_dir_use_symlinks=False)
         print(f"[FireRedFast] Download complete: {repo_id}")
+    else:
+        # Resume download in case of incomplete/corrupt files
+        print(f"[FireRedFast] Verifying {repo_id} (resume if incomplete) ...")
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=local_path,
+            local_dir_use_symlinks=False,
+            resume_download=True,
+        )
     return local_path
 
 
@@ -62,8 +71,8 @@ class FireRedFastLoader:
                 }),
                 "precision": (["bf16", "fp16"], {"default": "bf16"}),
                 "offload": (
-                    ["model_cpu_offload", "sequential_cpu_offload", "full_gpu"],
-                    {"default": "model_cpu_offload"},
+                    ["sequential_cpu_offload", "model_cpu_offload", "full_gpu"],
+                    {"default": "sequential_cpu_offload", "tooltip": "sequential_cpu_offload recommended for 12GB VRAM"},
                 ),
                 "enable_fa3": ("BOOLEAN", {
                     "default": False,
@@ -117,20 +126,39 @@ class FireRedFastLoader:
         from .qwenimage.transformer_qwenimage import QwenImageTransformer2DModel
 
         device = mm.get_torch_device()
+        device_str = str(device)  # e.g. "cuda:0"
 
-        print(f"[FireRedFast] Loading fast transformer from {transformer_path} ...")
+        # Load transformer directly to VRAM so it does NOT occupy CPU RAM while
+        # the large text encoder (Qwen2.5-VL ~14 GB) loads.  This mirrors the
+        # original Space and is the key fix for 12 GB VRAM / limited RAM setups.
+        print(f"[FireRedFast] Loading fast transformer → {device_str} ...")
         transformer = QwenImageTransformer2DModel.from_pretrained(
             transformer_path,
             torch_dtype=dtype,
+            device_map=device_str,
         )
+        pbar.update(1)
 
-        print(f"[FireRedFast] Loading pipeline from {base_path} ({precision}) ...")
+        # Load the remaining pipeline components (VAE, text encoder, scheduler …)
+        # to CPU RAM via memory-mapped safetensors to keep the RAM peak low.
+        print(f"[FireRedFast] Loading pipeline components from {base_path} ({precision}) ...")
         pipe = QwenImageEditPlusPipeline.from_pretrained(
             base_path,
             transformer=transformer,
             torch_dtype=dtype,
+            low_cpu_mem_usage=True,
         )
         pbar.update(1)
+
+        # VAE memory optimisations — slice/tile large images to reduce decode peak
+        if hasattr(pipe.vae, "enable_slicing"):
+            pipe.vae.enable_slicing()
+        if hasattr(pipe.vae, "enable_tiling"):
+            pipe.vae.enable_tiling()
+
+        # Attention slicing keeps per-step attention memory bounded
+        if hasattr(pipe, "enable_attention_slicing"):
+            pipe.enable_attention_slicing(1)
 
         # Flash Attention 3
         if enable_fa3:
@@ -185,18 +213,14 @@ class FireRedFastSampler:
                     "default": 4, "min": 1, "max": 50,
                     "tooltip": "4 steps is the intended fast mode; increase for higher quality.",
                 }),
-                "guidance_scale": ("FLOAT", {
-                    "default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1,
-                    "tooltip": "true_cfg_scale. 1.0 works best for the fast distilled model.",
+                "guidance_scale": ("STRING", {
+                    "default": "1.0",
+                    "tooltip": "true_cfg_scale (1.0 works best). Workaround: STRING type avoids UI widget-order bugs.",
                 }),
             },
             "optional": {
                 "image1": ("IMAGE", {"tooltip": "Primary image to edit (Picture 1)"}),
                 "image2": ("IMAGE", {"tooltip": "Secondary reference image (Picture 2)"}),
-                "negative_prompt": ("STRING", {
-                    "multiline": True,
-                    "default": DEFAULT_NEGATIVE,
-                }),
                 "width": ("INT", {
                     "default": 0, "min": 0, "max": 4096, "step": 8,
                     "tooltip": "0 = auto from image1 aspect ratio",
@@ -226,10 +250,16 @@ class FireRedFastSampler:
         guidance_scale,
         image1=None,
         image2=None,
-        negative_prompt=DEFAULT_NEGATIVE,
         width=0,
         height=0,
     ):
+        # Parse guidance_scale (STRING workaround for UI widget-order bugs)
+        try:
+            cfg = float(guidance_scale)
+        except (TypeError, ValueError):
+            cfg = 1.0
+        cfg = max(1.0, min(10.0, cfg))
+
         pipe = firered_fast_pipe["pipeline"]
 
         # Collect PIL images
@@ -258,18 +288,18 @@ class FireRedFastSampler:
 
         print(
             f"[FireRedFast] Generating {width}x{height}, steps={steps}, "
-            f"cfg={guidance_scale}, images={len(pil_images)}, seed={seed}"
+            f"cfg={cfg}, images={len(pil_images)}, seed={seed}"
         )
 
         with torch.no_grad():
             result = pipe(
                 image=image_arg,
                 prompt=prompt,
-                negative_prompt=negative_prompt,
+                negative_prompt=DEFAULT_NEGATIVE,
                 height=height,
                 width=width,
                 num_inference_steps=steps,
-                true_cfg_scale=guidance_scale,
+                true_cfg_scale=cfg,
                 generator=generator,
                 callback_on_step_end=callback,
             )
