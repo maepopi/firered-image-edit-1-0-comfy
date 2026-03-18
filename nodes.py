@@ -24,6 +24,14 @@ BASE_MODEL_ID = "FireRedTeam/FireRed-Image-Edit-1.1"
 FAST_TRANSFORMER_ID = "prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19"
 
 
+def _apply_disk_offload(model, offload_dir, device):
+    """Write model weights to disk (skipped if already cached) and install lazy-load hooks."""
+    from accelerate import disk_offload as _disk_offload
+    os.makedirs(offload_dir, exist_ok=True)
+    _disk_offload(model, offload_dir, execution_device=device)
+    gc.collect()
+
+
 def _resolve_or_download(repo_id, models_dir):
     """Return a local path for repo_id, downloading via snapshot_download if needed."""
     if os.path.isdir(repo_id):
@@ -72,8 +80,9 @@ class FireRedFastLoader:
                 }),
                 "precision": (["bf16", "fp16"], {"default": "bf16"}),
                 "offload": (
-                    ["sequential_cpu_offload", "model_cpu_offload", "full_gpu"],
-                    {"default": "sequential_cpu_offload", "tooltip": "sequential_cpu_offload recommended for 12GB VRAM"},
+                    ["disk_offload", "full_gpu"],
+                    {"default": "disk_offload",
+                     "tooltip": "disk_offload: streams weights from disk layer-by-layer (~9 GB RAM, any VRAM). full_gpu: loads everything to VRAM (needs ~40+ GB VRAM)."},
                 ),
                 "enable_fa3": ("BOOLEAN", {
                     "default": False,
@@ -101,7 +110,7 @@ class FireRedFastLoader:
             print("[FireRedFast] Using cached pipeline.")
             return ({"pipeline": _cached_pipe, "dtype": dtype},)
 
-        # Clear previous pipeline
+        # Clear previous pipeline from memory
         if _cached_pipe is not None:
             del _cached_pipe
             _cached_pipe = None
@@ -114,7 +123,7 @@ class FireRedFastLoader:
         models_dir = os.path.join(folder_paths.models_dir, "diffusers")
         os.makedirs(models_dir, exist_ok=True)
 
-        pbar = comfy.utils.ProgressBar(4)
+        pbar = comfy.utils.ProgressBar(6)
 
         # Resolve / download models
         base_path = _resolve_or_download(base_model_id, models_dir)
@@ -128,42 +137,63 @@ class FireRedFastLoader:
 
         device = mm.get_torch_device()
 
-        # Load transformer to CPU RAM first.  With 62 GB RAM this is fine, and
-        # loading to CPU (not VRAM) is required so that sequential_cpu_offload
-        # can install its hooks cleanly without conflicting with device_map.
-        print(f"[FireRedFast] Loading fast transformer to CPU ...")
+        # ── Step 1: Load transformer (~40 GB RAM peak due to float8→bf16 conversion) ──
+        # These weights are stored as float8 on disk (20 GB) but expand to ~40 GB in bf16.
+        print("[FireRedFast] Loading fast transformer (~40 GB RAM, drops after offload) ...")
         transformer = QwenImageTransformer2DModel.from_pretrained(
             transformer_path,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
         )
         pbar.update(1)
-        gc.collect()
 
-        # Load remaining pipeline components (text encoder, VAE, scheduler …)
-        # to CPU via memory-mapped safetensors.
-        print(f"[FireRedFast] Loading pipeline components from {base_path} ({precision}) ...")
-        pipe = QwenImageEditPlusPipeline.from_pretrained(
-            base_path,
-            transformer=transformer,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
-        pbar.update(1)
-        gc.collect()
-        torch.cuda.empty_cache()
+        if offload == "disk_offload":
+            # ── Step 2: Disk-offload transformer immediately ──────────────────────────
+            # accelerate.disk_offload writes weights to disk (first run) or re-uses
+            # existing files if index.json already exists.  After this call, the
+            # transformer's parameters are replaced by lazy disk-mapped references and
+            # RAM drops from ~40 GB back to ~9 GB.
+            offload_base = os.path.join(models_dir, "firered_fast_offload")
+            t_offload_dir   = os.path.join(offload_base, "transformer")
+            te_offload_dir  = os.path.join(offload_base, "text_encoder")
+            vae_offload_dir = os.path.join(offload_base, "vae")
 
-        # VAE optimisations — reduce decode VRAM peak for large images
-        if hasattr(pipe.vae, "enable_slicing"):
-            pipe.vae.enable_slicing()
-        if hasattr(pipe.vae, "enable_tiling"):
-            pipe.vae.enable_tiling()
+            print("[FireRedFast] Disk-offloading transformer (first run writes ~39 GB, cached after) ...")
+            _apply_disk_offload(transformer, t_offload_dir, device)
+            torch.cuda.empty_cache()
+            pbar.update(1)
 
-        # Attention slicing caps the per-step activation spike inside the transformer
-        if hasattr(pipe, "enable_attention_slicing"):
-            pipe.enable_attention_slicing(1)
+            # ── Step 3: Load remaining pipeline components (text encoder via mmap) ───
+            print(f"[FireRedFast] Loading pipeline from {base_path} ({precision}) ...")
+            pipe = QwenImageEditPlusPipeline.from_pretrained(
+                base_path,
+                transformer=transformer,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
+            gc.collect()
+            pbar.update(1)
 
-        # Flash Attention 3
+            # ── Step 4: Disk-offload text encoder and VAE ────────────────────────────
+            print("[FireRedFast] Disk-offloading text encoder and VAE ...")
+            _apply_disk_offload(pipe.text_encoder, te_offload_dir, device)
+            _apply_disk_offload(pipe.vae, vae_offload_dir, device)
+            torch.cuda.empty_cache()
+            pbar.update(1)
+
+        else:  # full_gpu
+            # Load pipeline and push everything to VRAM — needs ~40+ GB VRAM.
+            print(f"[FireRedFast] Loading pipeline (full GPU) from {base_path} ({precision}) ...")
+            pipe = QwenImageEditPlusPipeline.from_pretrained(
+                base_path,
+                transformer=transformer,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
+            pipe.to(device)
+            pbar.update(3)
+
+        # Flash Attention 3 (optional)
         if enable_fa3:
             try:
                 from .qwenimage.qwen_fa3_processor import QwenDoubleStreamAttnProcessorFA3
@@ -171,16 +201,6 @@ class FireRedFastLoader:
                 print("[FireRedFast] Flash Attention 3 enabled.")
             except Exception as e:
                 print(f"[FireRedFast] Could not enable FA3: {e}")
-
-        # Apply offload / device strategy
-        if offload == "model_cpu_offload":
-            pipe.enable_model_cpu_offload()
-        elif offload == "sequential_cpu_offload":
-            pipe.enable_sequential_cpu_offload()
-        else:
-            pipe.to(device)
-
-        pbar.update(1)
 
         _cached_pipe = pipe
         _cached_key = cache_key
