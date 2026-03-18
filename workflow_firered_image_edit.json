@@ -1,0 +1,37 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "example.png"
+    }
+  },
+  "2": {
+    "class_type": "FireRedFastLoader",
+    "inputs": {
+      "base_model_id": "FireRedTeam/FireRed-Image-Edit-1.1",
+      "fast_transformer_id": "prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19",
+      "precision": "bf16",
+      "offload": "model_cpu_offload",
+      "enable_fa3": false
+    }
+  },
+  "3": {
+    "class_type": "FireRedFastSampler",
+    "inputs": {
+      "firered_fast_pipe": ["2", 0],
+      "prompt": "Change the style to oil painting.",
+      "seed": 0,
+      "steps": 4,
+      "guidance_scale": 1.0,
+      "image1": ["1", 0],
+      "negative_prompt": "worst quality, low quality, bad anatomy, bad hands, missing fingers, extra fingers, blurry, watermark, text, signature, deformed, ugly"
+    }
+  },
+  "4": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "firered_edit",
+      "images": ["3", 0]
+    }
+  }
+}
