@@ -80,9 +80,9 @@ class FireRedFastLoader:
                 }),
                 "precision": (["bf16", "fp16"], {"default": "bf16"}),
                 "offload": (
-                    ["disk_offload", "full_gpu"],
+                    ["disk_offload", "full_gpu", "sequential_cpu_offload", "model_cpu_offload"],
                     {"default": "disk_offload",
-                     "tooltip": "disk_offload: streams weights from disk layer-by-layer (~9 GB RAM, any VRAM). full_gpu: loads everything to VRAM (needs ~40+ GB VRAM)."},
+                     "tooltip": "disk_offload (recommended): streams weights from disk, ~9 GB RAM, works on any VRAM. full_gpu: needs ~40+ GB VRAM. sequential/model_cpu_offload: legacy aliases for disk_offload."},
                 ),
                 "enable_fa3": ("BOOLEAN", {
                     "default": False,
@@ -146,6 +146,11 @@ class FireRedFastLoader:
             low_cpu_mem_usage=True,
         )
         pbar.update(1)
+
+        # Legacy aliases → disk_offload
+        if offload in ("sequential_cpu_offload", "model_cpu_offload"):
+            print(f"[FireRedFast] '{offload}' is a legacy option — using disk_offload instead.")
+            offload = "disk_offload"
 
         if offload == "disk_offload":
             # ── Step 2: Disk-offload transformer immediately ──────────────────────────
