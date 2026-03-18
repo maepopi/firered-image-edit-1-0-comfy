@@ -25,7 +25,7 @@ Search for `FireRed Image Edit` and install.
 ### Manual
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/maepopi/firered-image-edit-1-0
+git clone https://github.com/maepopi/firered-image-edit-1-0-comfy
 cd firered-image-edit-1-0
 pip install -r requirements.txt
 ```
@@ -51,9 +51,9 @@ Downloads and loads the pipeline. The pipeline is cached between runs — if set
 | `enable_fa3` | BOOLEAN | `False` | Enable Flash Attention 3 (requires `flash-attn` installed) |
 
 **Offload options:**
-- `model_cpu_offload` — moves model components to CPU when not in use (good balance of speed and VRAM)
-- `sequential_cpu_offload` — more aggressive offloading, slower but lower peak VRAM
-- `full_gpu` — keep everything on GPU, fastest but requires most VRAM
+- `sequential_cpu_offload` *(default, recommended for ≤ 16 GB VRAM)* — streams one model component at a time through the GPU. Only the currently-executing layer is on GPU; everything else stays on CPU. Slowest, but lowest peak VRAM.
+- `model_cpu_offload` — keeps each full component (text encoder, transformer, VAE) on CPU and moves it to GPU as a whole when needed. Faster than sequential but higher peak VRAM.
+- `full_gpu` — keeps everything on GPU at all times. Fastest, but requires enough VRAM to hold the whole pipeline at once (not recommended for < 24 GB).
 
 **Output:** `FIRERED_FAST_PIPE` — pass to the sampler node.
 
@@ -129,6 +129,37 @@ Explicitly frees the pipeline from GPU and CPU memory. Useful when switching to 
 - **Keep `guidance_scale` at 1.0.** Higher values can over-saturate results with this distilled model.
 - **Output resolution** is auto-calculated to ~1024×1024 total pixels while preserving the input aspect ratio, matching the original Space behavior.
 - **Flash Attention 3** (`enable_fa3=True`) can speed up inference if you have `flash-attn` installed and a compatible GPU (Ampere/Ada/Hopper).
+
+---
+
+## Memory & VRAM notes
+
+This pipeline is heavy. It contains two large models:
+
+| Component | Size (bf16) |
+|---|---|
+| Fast transformer (Qwen-Image-Edit-Rapid-AIO-V19) | ~7–8 GB |
+| Text encoder (Qwen2.5-VL 7B) | ~14 GB |
+| VAE | ~1 GB |
+
+Running both in VRAM simultaneously requires ~24 GB. On a 12–16 GB card, `sequential_cpu_offload` is required.
+
+### How loading is optimised for limited RAM
+
+A naive load would put the transformer (~7–8 GB) into CPU RAM first, then try to load the text encoder (~14 GB) on top — easily exceeding 20+ GB of system RAM and crashing the process.
+
+This node avoids that by loading in two stages:
+
+1. **Transformer → VRAM directly** (`device_map="cuda"`): the transformer is mapped straight into GPU memory, so it never occupies CPU RAM.
+2. **Remaining components → CPU RAM** via memory-mapped safetensors (`low_cpu_mem_usage=True`): the text encoder, VAE, scheduler, and tokenizer are loaded from disk using memory-mapping, which avoids allocating a full in-memory copy during the load. Peak RAM usage is roughly the size of the text encoder alone (~14 GB).
+
+Once loading is complete, `sequential_cpu_offload` sets up forward hooks on all components. During inference, each component is moved to GPU only for its forward pass, then immediately returned to CPU — so peak VRAM at inference time is the size of the largest single component (~8 GB for the transformer), not the whole pipeline.
+
+### Additional inference-time optimisations
+
+- **VAE slicing** — decodes the latent in slices rather than all at once, reducing decode memory.
+- **VAE tiling** — processes large images in tiles, keeping VRAM flat regardless of output resolution.
+- **Attention slicing** — computes self-attention one head at a time, capping the per-step VRAM spike during transformer forward passes.
 
 ---
 
