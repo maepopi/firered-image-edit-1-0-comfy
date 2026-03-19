@@ -1,178 +1,170 @@
 # FireRed Image Edit 1.0 — ComfyUI Custom Node
 
-A ComfyUI custom node wrapping the **FireRed-Image-Edit-1.1** pipeline with the fast **Qwen-Image-Edit-Rapid-AIO-V19** transformer, enabling high-quality image editing in as few as **4 inference steps**.
-
-Based on the [FireRed-Image-Edit-1.0-Fast](https://huggingface.co/spaces/prithivMLmods/FireRed-Image-Edit-1.0-Fast) HuggingFace Space by prithivMLmods.
+A ComfyUI custom node for **FireRed-Image-Edit-1.1** with the fast **Qwen-Image-Edit-Rapid-AIO-V19** transformer. Edit images in ~4 steps using a vision-language model as the backbone.
 
 ---
 
-## Models used
+## What this is
 
-| Role | Model |
-|---|---|
-| Base pipeline (VAE, scheduler, text encoder) | [FireRedTeam/FireRed-Image-Edit-1.1](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1) |
-| Fast transformer | [prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19](https://huggingface.co/prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19) |
+[FireRed-Image-Edit-1.1](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1) is an instruction-based image editing model built on top of Qwen2.5-VL. You describe what you want changed in plain language and the model applies the edit while preserving unrelated parts of the image.
 
-Both are downloaded automatically on first use and cached in your ComfyUI `models/diffusers/` folder.
+The [Rapid-AIO transformer](https://huggingface.co/prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19) is a distilled version that runs in as few as 4 steps instead of the usual 20–50, making it practical for iterative editing workflows.
+
+Original Space: [prithivMLmods/FireRed-Image-Edit-1.0-Fast](https://huggingface.co/spaces/prithivMLmods/FireRed-Image-Edit-1.0-Fast)
+
+---
+
+## System requirements
+
+| Component | Minimum |
+|-----------|---------|
+| GPU VRAM  | 12 GB   |
+| System RAM | 42 GB free at load time |
+| Disk space | ~36 GB for model weights |
+
+### Why so much RAM?
+
+The fast transformer weights are stored on disk in **float8** format (20 GB). When loaded into PyTorch for inference they must be converted to **bfloat16** (2 bytes per parameter instead of 1), which doubles the in-memory size to ~40 GB. This conversion is unavoidable on GPUs that do not support native float8 compute (anything before Hopper/H100).
+
+The text encoder (Qwen2.5-VL 7B) adds another ~16 GB on disk, but because it is memory-mapped with `low_cpu_mem_usage=True` its pages load lazily — it barely increases RAM usage at load time. Total settled RAM after loading: **~42 GB**.
+
+### Why `sequential_cpu_offload`?
+
+The combined model is ~56 GB in bfloat16, far larger than a 12 GB GPU. `sequential_cpu_offload` solves this by keeping all weights in CPU RAM and moving one layer at a time to the GPU just before its forward pass, then immediately moving it back. Peak VRAM during inference is ~1–2 GB per layer rather than the full model size.
+
+Alternative approaches that were tried and abandoned during development:
+
+- **`device_map="cuda"` for the transformer** — conflicts with `sequential_cpu_offload` hooks, causing both to fight over device placement and producing garbage output.
+- **`disk_offload`** — streams weights from disk instead of RAM, which would drop settled RAM to ~9 GB. Abandoned because the `init_empty_weights` fast-load path (needed to avoid a 40 GB RAM spike on every session start) crashes for this custom model class. The slow path still hit the RAM limit when combined with ComfyUI's own memory usage.
+
+`sequential_cpu_offload` is the only approach verified working end-to-end on a 12 GB VRAM / 62 GB RAM system.
 
 ---
 
 ## Installation
 
-### Via ComfyUI Manager
-Search for `FireRed Image Edit` and install.
+### 1. Clone into your ComfyUI custom nodes directory
 
-### Manual
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/maepopi/firered-image-edit-1-0-comfy
-cd firered-image-edit-1-0
-pip install -r requirements.txt
+git clone https://github.com/maepopi/firered-image-edit-1-0-comfy firered-image-edit-1-0
 ```
 
-> **Note:** The `requirements.txt` pulls the latest `diffusers` and `accelerate` from GitHub, which is required for the QwenImage pipeline classes.
+### 2. Install dependencies
+
+Activate your ComfyUI Python environment, then:
+
+```bash
+pip install -r firered-image-edit-1-0/requirements.txt
+```
+
+### 3. Models download automatically
+
+On the first run the Loader node downloads both models from HuggingFace into `ComfyUI/models/diffusers/`:
+
+- `FireRedTeam--FireRed-Image-Edit-1.1` (~54 GB total)
+- `prithivMLmods--Qwen-Image-Edit-Rapid-AIO-V19` (~20 GB)
+
+This only happens once. Subsequent runs verify and resume any incomplete downloads.
 
 ---
 
 ## Nodes
 
-All nodes appear under the **`FireRedEdit/Fast`** category.
-
 ### FireRed Fast Loader (1.1)
 
-Downloads and loads the pipeline. The pipeline is cached between runs — if settings are unchanged, subsequent runs skip reloading entirely.
+Loads the pipeline and caches it. The cache persists for the entire ComfyUI session — rerunning the workflow with the same settings is instant.
 
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `base_model_id` | STRING | `FireRedTeam/FireRed-Image-Edit-1.1` | HuggingFace repo ID or local path for the base pipeline |
-| `fast_transformer_id` | STRING | `prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19` | HuggingFace repo ID or local path for the fast transformer |
-| `precision` | bf16 / fp16 | `bf16` | Weight dtype — bf16 recommended |
-| `offload` | dropdown | `model_cpu_offload` | Memory strategy (see below) |
-| `enable_fa3` | BOOLEAN | `False` | Enable Flash Attention 3 (requires `flash-attn` installed) |
+| Parameter | Description |
+|-----------|-------------|
+| `base_model_id` | HuggingFace repo ID or local path for the base pipeline. Default: `FireRedTeam/FireRed-Image-Edit-1.1` |
+| `fast_transformer_id` | HuggingFace repo ID or local path for the fast transformer. Default: `prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19` |
+| `precision` | `bf16` (recommended) or `fp16`. `bf16` matches the original training dtype. |
+| `enable_fa3` | Enable Flash Attention 3 for faster inference. Requires `flash-attn` installed separately. Leave off if unsure. |
 
-**Offload options:**
-- `sequential_cpu_offload` *(default, recommended for ≤ 16 GB VRAM)* — streams one model component at a time through the GPU. Only the currently-executing layer is on GPU; everything else stays on CPU. Slowest, but lowest peak VRAM.
-- `model_cpu_offload` — keeps each full component (text encoder, transformer, VAE) on CPU and moves it to GPU as a whole when needed. Faster than sequential but higher peak VRAM.
-- `full_gpu` — keeps everything on GPU at all times. Fastest, but requires enough VRAM to hold the whole pipeline at once (not recommended for < 24 GB).
-
-**Output:** `FIRERED_FAST_PIPE` — pass to the sampler node.
+**Important:** Before loading, the node calls `unload_all_models()` to free all other ComfyUI models from memory. Do not run other memory-heavy nodes in the same workflow as the loader.
 
 ---
 
 ### FireRed Fast Sampler (1.1)
 
-Runs the editing inference. Connect one or two images and describe your edit in the prompt.
+Runs the editing inference. Connect the pipe output from the Loader and at least one image.
 
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `firered_fast_pipe` | FIRERED_FAST_PIPE | required | Pipeline from the Loader node |
-| `prompt` | STRING | — | Editing instruction |
-| `seed` | INT | 0 | Reproducibility seed |
-| `steps` | INT | 4 | Inference steps — 4 is the intended fast mode |
-| `guidance_scale` | FLOAT | 1.0 | `true_cfg_scale` — 1.0 works best for the distilled model |
-| `image1` | IMAGE | optional | Primary image to edit (referenced as "Picture 1") |
-| `image2` | IMAGE | optional | Secondary reference image (referenced as "Picture 2") |
-| `negative_prompt` | STRING | *see node* | Negative conditioning |
-| `width` | INT | 0 | Output width — 0 = auto from image1 aspect ratio |
-| `height` | INT | 0 | Output height — 0 = auto from image1 aspect ratio |
+| Parameter | Description |
+|-----------|-------------|
+| `firered_fast_pipe` | Connect from the Loader output |
+| `prompt` | Plain-language editing instruction (see examples below) |
+| `seed` | Random seed for reproducibility |
+| `steps` | Number of denoising steps. **Minimum 4** — 1 step produces a black image. 4 is the intended fast mode; 8–12 gives higher quality at the cost of speed. |
+| `guidance_scale` | `true_cfg_scale`. Default `1.0`. Higher values (e.g. `3.0`–`5.0`) follow the prompt more strictly but may introduce artifacts. |
+| `image1` | Primary image to edit (referred to as "Picture 1" in prompts) |
+| `image2` | Optional second reference image ("Picture 2") — useful for style or clothing transfer |
+| `width` / `height` | Output size in pixels. `0` = auto-computed from `image1`'s aspect ratio, targeting ~768×768 total pixels. Must be multiples of 8. |
 
-**Output:** `IMAGE`
+---
 
-#### Multi-image editing
-When two images are connected, the model sees them as **Picture 1** and **Picture 2**. You can reference them directly in the prompt:
+### FireRed Fast Unloader
 
+Explicitly frees the pipeline from CPU RAM and clears the session cache. Use this when you are done editing and want to load other large models.
+
+---
+
+## Example prompts
+
+Single image editing:
 ```
-Transfer the glasses from Picture 2 onto the person in Picture 1, keep everything else the same.
+Change the style to oil painting.
+Make it look like a watercolor illustration.
+Turn this into a pencil sketch.
+Change the hair color to blonde.
+Add sunglasses.
+Make the background a sunset beach.
+Remove the person from the background.
+Make the image look like it was taken at night.
 ```
 
+Two-image reference (connect both `image1` and `image2`):
 ```
-Dress the person in Picture 1 with the outfit from Picture 2, preserve the face and pose.
-```
-
-#### Single-image editing
-```
-Convert to black and white with high contrast.
-Convert to a dotted cartoon style.
-Apply a cinematic polaroid look with warm tones.
-Make the background a snowy mountain landscape.
+Apply the style of Picture 2 to Picture 1.
+Transfer the clothing from Picture 2 onto the person in Picture 1.
+Make the person in Picture 1 wear the glasses from Picture 2.
 ```
 
 ---
 
-### FireRed Fast Unloader (1.1)
+## Recommended workflow
 
-Explicitly frees the pipeline from GPU and CPU memory. Useful when switching to other large models.
+1. **Load Image** → connect to `image1` on the Sampler
+2. **FireRed Fast Loader** → connect output to `firered_fast_pipe` on the Sampler
+3. **FireRed Fast Sampler** → set `steps` to `4`, `guidance_scale` to `1.0`, write your prompt
+4. Connect `IMAGE` output to **Save Image** or **Preview Image**
+5. *(Optional)* Add **FireRed Fast Unloader** at the end of the workflow to free memory when done
 
-| Input | Type | Description |
-|---|---|---|
-| `firered_fast_pipe` | FIRERED_FAST_PIPE | Pipeline to unload |
-
----
-
-## Typical workflow
-
-```
-[Load Image] ──────────────────────────────────────────┐
-                                                        ▼
-[FireRed Fast Loader (1.1)] ──► [FireRed Fast Sampler (1.1)] ──► [Save Image]
-                                        ▲
-                             prompt: "Make it look like an oil painting"
-                             steps: 4
-                             guidance_scale: 1.0
-```
+Output resolution auto-scales from the input image's aspect ratio to ~768×768 pixels. Override with explicit `width`/`height` values if needed.
 
 ---
 
-## Tips
+## Troubleshooting
 
-- **4 steps is enough.** The fast transformer is distilled for low-step inference — pushing steps beyond 10–15 rarely improves quality meaningfully.
-- **Keep `guidance_scale` at 1.0.** Higher values can over-saturate results with this distilled model.
-- **Output resolution** is auto-calculated to ~1024×1024 total pixels while preserving the input aspect ratio, matching the original Space behavior.
-- **Flash Attention 3** (`enable_fa3=True`) can speed up inference if you have `flash-attn` installed and a compatible GPU (Ampere/Ada/Hopper).
+**Black output image**
+The most common cause is `steps = 1`. Set steps to at least **4**.
 
----
+**Out of memory / process killed during load**
+The transformer needs ~40 GB RAM to load. Close other applications, make sure no other large ComfyUI models are loaded, and try again. The node calls `unload_all_models()` automatically but other OS processes can compete for RAM.
 
-## Memory & VRAM notes
+**`guidance_scale` field shows the negative prompt text**
+Your saved workflow has a stale value from an older version of this node. Clear the field and type `1.0`.
 
-This pipeline is heavy. It contains two large models:
+**`offload` dropdown still visible in the Loader**
+Right-click the Loader node → Update node. The offload dropdown was removed in a refactor; `sequential_cpu_offload` is now the only strategy.
 
-| Component | Size (bf16) |
-|---|---|
-| Fast transformer (Qwen-Image-Edit-Rapid-AIO-V19) | ~7–8 GB |
-| Text encoder (Qwen2.5-VL 7B) | ~14 GB |
-| VAE | ~1 GB |
-
-Running both in VRAM simultaneously requires ~24 GB. On a 12–16 GB card, `sequential_cpu_offload` is required.
-
-### How loading is optimised for limited RAM
-
-A naive load would put the transformer (~7–8 GB) into CPU RAM first, then try to load the text encoder (~14 GB) on top — easily exceeding 20+ GB of system RAM and crashing the process.
-
-This node avoids that by loading in two stages:
-
-1. **Transformer → VRAM directly** (`device_map="cuda"`): the transformer is mapped straight into GPU memory, so it never occupies CPU RAM.
-2. **Remaining components → CPU RAM** via memory-mapped safetensors (`low_cpu_mem_usage=True`): the text encoder, VAE, scheduler, and tokenizer are loaded from disk using memory-mapping, which avoids allocating a full in-memory copy during the load. Peak RAM usage is roughly the size of the text encoder alone (~14 GB).
-
-Once loading is complete, `sequential_cpu_offload` sets up forward hooks on all components. During inference, each component is moved to GPU only for its forward pass, then immediately returned to CPU — so peak VRAM at inference time is the size of the largest single component (~8 GB for the transformer), not the whole pipeline.
-
-### Additional inference-time optimisations
-
-- **VAE slicing** — decodes the latent in slices rather than all at once, reducing decode memory.
-- **VAE tiling** — processes large images in tiles, keeping VRAM flat regardless of output resolution.
-- **Attention slicing** — computes self-attention one head at a time, capping the per-step VRAM spike during transformer forward passes.
+**Slow inference**
+With `sequential_cpu_offload`, each denoising step moves hundreds of layers individually through the CPU→GPU→CPU cycle. At 4 steps on a 12 GB GPU expect **30–90 seconds** per generation. This is normal for a model this size on consumer hardware.
 
 ---
 
-## Requirements
+## Technical notes
 
-- Python 3.10+
-- PyTorch with CUDA
-- See `requirements.txt` for Python dependencies
+The bundled `qwenimage/` directory contains a local copy of the pipeline and transformer classes adapted from the [diffusers](https://github.com/huggingface/diffusers) library. This is necessary because the upstream diffusers version may not yet have the exact pipeline variant used by FireRed-Image-Edit-1.1.
 
----
-
-## Credits
-
-- Pipeline: [FireRedTeam](https://huggingface.co/FireRedTeam)
-- Fast transformer & Space: [prithivMLmods](https://huggingface.co/prithivMLmods)
-- Bundled `qwenimage` module from the [FireRed-Image-Edit-1.0-Fast Space](https://huggingface.co/spaces/prithivMLmods/FireRed-Image-Edit-1.0-Fast)
+Loading uses `low_cpu_mem_usage=True` throughout, which enables safetensors memory-mapping for components that do not require dtype conversion. The text encoder in particular stays largely on disk until its pages are accessed during the first inference forward pass.
