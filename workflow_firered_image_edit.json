@@ -2,7 +2,7 @@
   "1": {
     "class_type": "LoadImage",
     "inputs": {
-      "image": "example.png"
+      "image": "002.png"
     }
   },
   "2": {
@@ -11,7 +11,7 @@
       "base_model_id": "FireRedTeam/FireRed-Image-Edit-1.1",
       "fast_transformer_id": "prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19",
       "precision": "bf16",
-      "offload": "model_cpu_offload",
+      "offload": "sequential_cpu_offload",
       "enable_fa3": false
     }
   },
@@ -23,8 +23,7 @@
       "seed": 0,
       "steps": 4,
       "guidance_scale": 1.0,
-      "image1": ["1", 0],
-      "negative_prompt": "worst quality, low quality, bad anatomy, bad hands, missing fingers, extra fingers, blurry, watermark, text, signature, deformed, ugly"
+      "image1": ["1", 0]
     }
   },
   "4": {

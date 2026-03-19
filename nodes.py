@@ -24,14 +24,6 @@ BASE_MODEL_ID = "FireRedTeam/FireRed-Image-Edit-1.1"
 FAST_TRANSFORMER_ID = "prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19"
 
 
-def _apply_disk_offload(model, offload_dir, device):
-    """Write model weights to disk (skipped if already cached) and install lazy-load hooks."""
-    from accelerate import disk_offload as _disk_offload
-    os.makedirs(offload_dir, exist_ok=True)
-    _disk_offload(model, offload_dir, execution_device=device)
-    gc.collect()
-
-
 def _resolve_or_download(repo_id, models_dir):
     """Return a local path for repo_id, downloading via snapshot_download if needed."""
     if os.path.isdir(repo_id):
@@ -44,8 +36,7 @@ def _resolve_or_download(repo_id, models_dir):
         snapshot_download(repo_id=repo_id, local_dir=local_path, local_dir_use_symlinks=False)
         print(f"[FireRedFast] Download complete: {repo_id}")
     else:
-        # Resume download in case of incomplete/corrupt files
-        print(f"[FireRedFast] Verifying {repo_id} (resume if incomplete) ...")
+        print(f"[FireRedFast] Verifying {repo_id} ...")
         snapshot_download(
             repo_id=repo_id,
             local_dir=local_path,
@@ -62,8 +53,11 @@ def _resolve_or_download(repo_id, models_dir):
 class FireRedFastLoader:
     """
     Loads the FireRed-Image-Edit-1.1 pipeline with the fast Qwen transformer
-    (prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19).  Optionally tries to enable
-    Flash-Attention-3 for extra speed.
+    (prithivMLmods/Qwen-Image-Edit-Rapid-AIO-V19).
+    Uses sequential_cpu_offload so the model streams layer-by-layer to VRAM
+    during inference — works on 12 GB VRAM with ~42 GB RAM settled.
+    The transformer weights expand from 20 GB (float8 on disk) to ~40 GB in
+    bfloat16; ensure no other large models are loaded at the same time.
     """
 
     @classmethod
@@ -79,14 +73,9 @@ class FireRedFastLoader:
                     "tooltip": "HuggingFace repo ID or local path for the fast transformer weights",
                 }),
                 "precision": (["bf16", "fp16"], {"default": "bf16"}),
-                "offload": (
-                    ["disk_offload", "full_gpu", "sequential_cpu_offload", "model_cpu_offload"],
-                    {"default": "disk_offload",
-                     "tooltip": "disk_offload (recommended): streams weights from disk, ~9 GB RAM, works on any VRAM. full_gpu: needs ~40+ GB VRAM. sequential/model_cpu_offload: legacy aliases for disk_offload."},
-                ),
                 "enable_fa3": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Try to enable Flash Attention 3 (requires fa3 / flash-attn installed)",
+                    "tooltip": "Try to enable Flash Attention 3 (requires flash-attn installed)",
                 }),
             },
         }
@@ -96,116 +85,83 @@ class FireRedFastLoader:
     FUNCTION = "load_pipeline"
     CATEGORY = "FireRedEdit/Fast"
     DESCRIPTION = (
-        "Loads FireRed-Image-Edit-1.1 with the fast Rapid-AIO transformer for ~4-step editing. "
-        "The pipeline is cached between runs so reloading is instant when settings are unchanged."
+        "Loads FireRed-Image-Edit-1.1 with the fast Rapid-AIO transformer. "
+        "Uses sequential_cpu_offload: weights stream layer-by-layer to GPU during inference. "
+        "Requires ~42 GB RAM and 12 GB VRAM. Pipeline is cached between runs."
     )
 
-    def load_pipeline(self, base_model_id, fast_transformer_id, precision, offload, enable_fa3):
+    def load_pipeline(self, base_model_id, fast_transformer_id, precision, enable_fa3):
         global _cached_pipe, _cached_key
 
         dtype = torch.bfloat16 if precision == "bf16" else torch.float16
-        cache_key = (base_model_id, fast_transformer_id, precision, offload, enable_fa3)
+        cache_key = (base_model_id, fast_transformer_id, precision, enable_fa3)
 
         if _cached_pipe is not None and _cached_key == cache_key:
             print("[FireRedFast] Using cached pipeline.")
             return ({"pipeline": _cached_pipe, "dtype": dtype},)
 
-        # Clear previous pipeline from memory
+        # Clear previous pipeline
         if _cached_pipe is not None:
+            with contextlib.suppress(Exception):
+                _cached_pipe.remove_all_hooks()
             del _cached_pipe
             _cached_pipe = None
             _cached_key = None
             gc.collect()
 
+        # Free all other ComfyUI models to make room for the ~40 GB transformer
         mm.unload_all_models()
         mm.soft_empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
 
         models_dir = os.path.join(folder_paths.models_dir, "diffusers")
         os.makedirs(models_dir, exist_ok=True)
 
-        pbar = comfy.utils.ProgressBar(6)
+        pbar = comfy.utils.ProgressBar(4)
 
-        # Resolve / download models
         base_path = _resolve_or_download(base_model_id, models_dir)
         pbar.update(1)
         transformer_path = _resolve_or_download(fast_transformer_id, models_dir)
         pbar.update(1)
 
-        # Import the bundled pipeline classes (local qwenimage module)
         from .qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
         from .qwenimage.transformer_qwenimage import QwenImageTransformer2DModel
 
-        device = mm.get_torch_device()
-
-        # ── Step 1: Load transformer (~40 GB RAM peak due to float8→bf16 conversion) ──
-        # These weights are stored as float8 on disk (20 GB) but expand to ~40 GB in bf16.
-        print("[FireRedFast] Loading fast transformer (~40 GB RAM, drops after offload) ...")
+        # Load transformer to CPU RAM.
+        # Note: weights are stored as float8 on disk (20 GB) and expand to ~40 GB
+        # in bfloat16. This is a one-time cost; RAM drops to ~42 GB after loading.
+        print("[FireRedFast] Loading transformer to CPU (~40 GB RAM) ...")
         transformer = QwenImageTransformer2DModel.from_pretrained(
             transformer_path,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
         )
         pbar.update(1)
+        gc.collect()
 
-        # Legacy aliases → disk_offload
-        if offload in ("sequential_cpu_offload", "model_cpu_offload"):
-            print(f"[FireRedFast] '{offload}' is a legacy option — using disk_offload instead.")
-            offload = "disk_offload"
-
-        if offload == "disk_offload":
-            # ── Step 2: Disk-offload transformer immediately ──────────────────────────
-            # accelerate.disk_offload writes weights to disk (first run) or re-uses
-            # existing files if index.json already exists.  After this call, the
-            # transformer's parameters are replaced by lazy disk-mapped references and
-            # RAM drops from ~40 GB back to ~9 GB.
-            offload_base = os.path.join(models_dir, "firered_fast_offload")
-            t_offload_dir   = os.path.join(offload_base, "transformer")
-            te_offload_dir  = os.path.join(offload_base, "text_encoder")
-            vae_offload_dir = os.path.join(offload_base, "vae")
-
-            print("[FireRedFast] Disk-offloading transformer (first run writes ~39 GB, cached after) ...")
-            _apply_disk_offload(transformer, t_offload_dir, device)
-            torch.cuda.empty_cache()
-            pbar.update(1)
-
-            # ── Step 3: Load remaining pipeline components (text encoder via mmap) ───
-            print(f"[FireRedFast] Loading pipeline from {base_path} ({precision}) ...")
-            pipe = QwenImageEditPlusPipeline.from_pretrained(
-                base_path,
-                transformer=transformer,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-            )
-            gc.collect()
-            pbar.update(1)
-
-            # ── Step 4: Disk-offload text encoder and VAE ────────────────────────────
-            print("[FireRedFast] Disk-offloading text encoder and VAE ...")
-            _apply_disk_offload(pipe.text_encoder, te_offload_dir, device)
-            _apply_disk_offload(pipe.vae, vae_offload_dir, device)
-            torch.cuda.empty_cache()
-            pbar.update(1)
-
-        else:  # full_gpu
-            # Load pipeline and push everything to VRAM — needs ~40+ GB VRAM.
-            print(f"[FireRedFast] Loading pipeline (full GPU) from {base_path} ({precision}) ...")
-            pipe = QwenImageEditPlusPipeline.from_pretrained(
-                base_path,
-                transformer=transformer,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-            )
-            pipe.to(device)
-            pbar.update(3)
+        # Load remaining pipeline components (text encoder mmap'd, loads lazily)
+        print(f"[FireRedFast] Loading pipeline from {base_path} ({precision}) ...")
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
+            base_path,
+            transformer=transformer,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Flash Attention 3 (optional)
         if enable_fa3:
-            try:
+            with contextlib.suppress(Exception):
                 from .qwenimage.qwen_fa3_processor import QwenDoubleStreamAttnProcessorFA3
                 pipe.transformer.set_attn_processor(QwenDoubleStreamAttnProcessorFA3())
                 print("[FireRedFast] Flash Attention 3 enabled.")
-            except Exception as e:
-                print(f"[FireRedFast] Could not enable FA3: {e}")
+
+        # sequential_cpu_offload: each layer moves to GPU only during its forward
+        # pass, keeping peak VRAM to ~1-2 GB per layer rather than the full model.
+        pipe.enable_sequential_cpu_offload()
+        pbar.update(1)
 
         _cached_pipe = pipe
         _cached_key = cache_key
@@ -243,7 +199,7 @@ class FireRedFastSampler:
                 }),
                 "guidance_scale": ("STRING", {
                     "default": "1.0",
-                    "tooltip": "true_cfg_scale (1.0 works best). Workaround: STRING type avoids UI widget-order bugs.",
+                    "tooltip": "true_cfg_scale (1.0 works best).",
                 }),
             },
             "optional": {
@@ -265,8 +221,7 @@ class FireRedFastSampler:
     CATEGORY = "FireRedEdit/Fast"
     DESCRIPTION = (
         "Edits images with the FireRed-Image-Edit-1.1 fast pipeline. "
-        "Connect image1 (and optionally image2) then describe your edit. "
-        "Default 4 steps is sufficient for the fast model."
+        "Connect image1 (and optionally image2) then describe your edit."
     )
 
     def generate(
@@ -281,7 +236,6 @@ class FireRedFastSampler:
         width=0,
         height=0,
     ):
-        # Parse guidance_scale (STRING workaround for UI widget-order bugs)
         try:
             cfg = float(guidance_scale)
         except (TypeError, ValueError):
@@ -290,20 +244,17 @@ class FireRedFastSampler:
 
         pipe = firered_fast_pipe["pipeline"]
 
-        # Collect PIL images
         pil_images = [
             comfy_images_to_pil(t)[0]
             for t in (image1, image2)
             if t is not None
         ]
 
-        # Resolve output dimensions
         if pil_images:
             if width == 0 or height == 0:
                 width, height = auto_resolution(pil_images[0].width, pil_images[0].height)
             image_arg = pil_images if len(pil_images) > 1 else pil_images[0]
         else:
-            # Text-to-image fallback — provide a blank image
             if width == 0:
                 width = 768
             if height == 0:
